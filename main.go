@@ -418,9 +418,26 @@ func RunBisect(reponame, lo, hi string, steps []string) bool {
 	{
 		_wrap_step := func(script_path, step string) string {
 			return fmt.Sprintf(`
+				CACHE_DIR=%s
+				REPO_DIR=%s
 				STEP_NAME=%s
-				%s "${STEP_NAME}"
+
+				# Creating the cache directory for this step's execution.
+				# Note: At script entry, cwd=cacherepo.
+				COMMIT_HASH=$(git rev-parse HEAD)
+				STEP_DIR="${CACHE_DIR}/_run/${COMMIT_HASH}/${STEP_NAME}"
+				echo "Step Dir: ${STEP_DIR}"
+				mkdir -p "${STEP_DIR}"
+
+				STEP_LOG_FILE="${STEP_DIR}/log.txt"
+
+				# Running the script for this step.
+				# Also preserve the results of the execution in the cache.
+				%s "${STEP_NAME}" > "${STEP_LOG_FILE}" 2>&1
 				RESULT=$?
+				cat "${STEP_LOG_FILE}"
+
+				# Checking ther results of the step's execution
 				if [ $RESULT -eq 0 ]
 				then
 					echo "xbisect step=${STEP_NAME} PASS"
@@ -428,7 +445,7 @@ func RunBisect(reponame, lo, hi string, steps []string) bool {
 					echo "xbisect step=${STEP_NAME} FAIL res=${RESULT}"
 					exit $RESULT
 				fi
-			`, step, script_path)
+			`, cachedir, cacherepo, step, script_path)
 		}
 
 		// Create a script that will run the main script for each step provided
@@ -586,7 +603,7 @@ func RunBisect(reponame, lo, hi string, steps []string) bool {
 						return fmt.Sprintf("%s%sFAIL%s", kFontBold, kColorRed, kConsoleReset)
 					}
 				}()
-				step_log := fmt.Sprintf("%s%s%s", kColorCyan, step.Name, kConsoleReset)
+				step_log := fmt.Sprintf("%s%12s%s", kColorCyan, step.Name, kConsoleReset)
 				ConsoleLogInfo("%s %s %s", hash, step_log, success_log)
 			}
 		}
