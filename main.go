@@ -421,6 +421,7 @@ func RunBisect(reponame, lo, hi string, steps []string) bool {
 				CACHE_DIR=%s
 				REPO_DIR=%s
 				STEP_NAME=%s
+				SCRIPT_PATH=%s
 
 				# Creating the cache directory for this step's execution.
 				# Note: At script entry, cwd=cacherepo.
@@ -433,7 +434,7 @@ func RunBisect(reponame, lo, hi string, steps []string) bool {
 
 				# Running the script for this step.
 				# Also preserve the results of the execution in the cache.
-				%s "${STEP_NAME}" > "${STEP_LOG_FILE}" 2>&1
+				"${SCRIPT_PATH}" "${STEP_NAME}" > "${STEP_LOG_FILE}" 2>&1
 				RESULT=$?
 				cat "${STEP_LOG_FILE}"
 
