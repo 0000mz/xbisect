@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/alecthomas/kong"
@@ -22,6 +23,18 @@ import (
 const (
 	kApplicationName       = "xbisect"
 	kApplicationDescrption = "Utility for bisecting applications"
+	// TODO: Make this a pre-compiled regex
+	kAlphanumericDashUnderlineRe = "^[a-zA-Z0-9_-]+$"
+
+	// Color Codes
+	kColorRed     = "\033[31m"
+	kColorGreen   = "\033[32m"
+	kColorCyan    = "\033[36m"
+	kColorGray    = "\033[37m"
+	kFontBold     = "\033[1m"
+	kConsoleReset = "\033[0m"
+
+	kBisectSkipCode = 125
 )
 
 var (
@@ -209,7 +222,7 @@ func ImportGitRepo(repo_url string, name string) bool {
 		ConsoleLogError("--name not specified for repo import.")
 		return false
 	}
-	if matched, err := regexp.MatchString("^[a-zA-Z0-9_-]+$", name); !matched || err != nil {
+	if matched, err := regexp.MatchString(kAlphanumericDashUnderlineRe, name); !matched || err != nil {
 		ConsoleLogError("Invalid repo name. Only alphanumeric and underscore/dash allowed.")
 		if err != nil {
 			gLogger.Printf("Regex error: %v\n", err)
@@ -276,15 +289,39 @@ func runCommandDir(dir string, command ...string) error {
 		cmd.Dir = dir
 	}
 	return cmd.Run()
-
 }
 
-func RunBisect(reponame, lo, hi string) bool {
+func runCommandDirOutput(dir string, command ...string) ([]byte, error) {
+	if len(command) < 1 {
+		return nil, fmt.Errorf("Empty command")
+	}
+	gLogger.Printf("Running command: %s\n", strings.Join(command, " "))
+	cmd := exec.Command(command[0], command[1:]...)
+	if len(dir) > 0 {
+		cmd.Dir = dir
+	}
+	return cmd.Output()
+}
+
+func RunBisect(reponame, lo, hi string, steps []string) bool {
 	repo := gConfig.GetRepo(reponame)
 	if repo == nil {
 		ConsoleLogError("No imported repo with name: \"%s\". Run %s import --help",
 			reponame, kApplicationName)
 		return false
+	}
+	if len(steps) == 0 {
+		ConsoleLogError("No steps provided to execute.")
+		return false
+	}
+	for _, step := range steps {
+		if matched, err := regexp.MatchString(kAlphanumericDashUnderlineRe, step); !matched || err != nil {
+			ConsoleLogError("Invalid step name. Only alphanumeric and underscore/dash allowed.")
+			if err != nil {
+				gLogger.Printf("Regex error: %v\n", err)
+			}
+			return false
+		}
 	}
 
 	cachedir := ""
@@ -333,6 +370,8 @@ func RunBisect(reponame, lo, hi string) bool {
 		echo "cwd: $(pwd)"
 		go run . > /tmp/compute 2>&1
 		cat /tmp/compute
+		# test $(cat /tmp/compute | awk '$2 < 40 { print }' | wc -l) -gt 0 || exit 125
+		test $(cat /tmp/compute | awk '$2 < 40 { print }' | wc -l) -gt 0
 		`
 		if _, err = tmpfile.WriteString(script); err != nil {
 			ConsoleLogError("Failed to write script data to tempfile")
@@ -360,13 +399,57 @@ func RunBisect(reponame, lo, hi string) bool {
 			return false
 		}
 	}
+
+	initial_commit_hash_b, err := runCommandDirOutput(cacherepo, "git", "rev-parse", "HEAD")
+	if err != nil || len(initial_commit_hash_b) == 0 {
+		if err != nil {
+			gLogger.Printf("Error: %v", err)
+		}
+		ConsoleLogError("Failed to get current commit hash")
+		return false
+	}
+	initial_commit_hash := strings.TrimSpace(string(initial_commit_hash_b))
+	gLogger.Printf("Repo initial commit hash: %s\n", initial_commit_hash)
 	ConsoleLogInfo("Running bisect script")
 	defer func() {
 		gLogger.Println("Resetting git bisect")
 		runCommandDir(cacherepo, "git", "bisect", "reset")
 	}()
 	{
-		cmd := exec.Command("git", "bisect", "run", tmpfile.Name())
+		_wrap_step := func(script_path, step string) string {
+			return fmt.Sprintf(`
+				STEP_NAME=%s
+				%s "${STEP_NAME}"
+				RESULT=$?
+				if [ $RESULT -eq 0 ]
+				then
+					echo "xbisect step=${STEP_NAME} PASS"
+				else
+					echo "xbisect step=${STEP_NAME} FAIL res=${RESULT}"
+					exit $RESULT
+				fi
+			`, step, script_path)
+		}
+
+		// Create a script that will run the main script for each step provided
+		// by the caller.
+		script_file := tmpfile.Name()
+		wrapper_script_file, err := os.CreateTemp("", "bisect_script_wrapper")
+		wrapper_script := ``
+		for _, step := range steps {
+			wrapper_script += _wrap_step(script_file, step) // fmt.Sprintf("%s %s\n", script_file, step)
+		}
+		gLogger.Printf("Wrapper Script:\n%s\n", wrapper_script)
+		if _, err = wrapper_script_file.WriteString(wrapper_script); err != nil {
+			gLogger.Printf("Error: %v\n", err)
+			ConsoleLogError("Failed to create wrapper script")
+			wrapper_script_file.Close()
+			return false
+		}
+		wrapper_script_file.Close()
+		runCommand("chmod", "+x", wrapper_script_file.Name()) // Give exec perms
+
+		cmd := exec.Command("git", "bisect", "run", wrapper_script_file.Name())
 		cmd.Dir = cacherepo
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
@@ -386,6 +469,8 @@ func RunBisect(reponame, lo, hi string) bool {
 		tee := io.TeeReader(stdout, &buf)
 
 		hashLineRe := regexp.MustCompile(`^\[(.*)\] .*$`)
+		statusMatchRe := regexp.MustCompile(`xbisect step=([a-zA-Z0-9_-]+) (PASS|FAIL)( res=[0-9]+)?`)
+		resMatchRe := regexp.MustCompile(`res=([0-9]+)`)
 
 		scanner := bufio.NewScanner(tee)
 		var lines_until_hash int64 = 0
@@ -393,26 +478,117 @@ func RunBisect(reponame, lo, hi string) bool {
 		var scan_succeed bool
 		scan_succeed = true
 
+		type StepResult struct {
+			Name       string
+			Pass       bool
+			ExitStatus int
+		}
+		type CommitResult struct {
+			Hash        string
+			StepResults []StepResult
+		}
+		_get_exit_status := func(data string) (int, error) {
+			if len(data) == 0 {
+				return 0, nil
+			}
+			res_match := resMatchRe.FindStringSubmatch(data)
+			if res_match == nil {
+				return 0, fmt.Errorf("Regex found no match")
+			}
+			exit_code, err := strconv.Atoi(res_match[1])
+			if err != nil {
+				return 0, err
+			}
+			return exit_code, nil
+		}
+
+		var commit_results map[string]*CommitResult = make(map[string]*CommitResult)
+		var current_result *CommitResult = nil
+		nb_commit_parse_from_current_line := 0
+		nb_commit_parse_from_regex := 0
+
 		for scanner.Scan() {
 			lines_until_hash -= 1
 
-			line := scanner.Text()
+			line := strings.TrimSpace(scanner.Text())
+			// TODO: Use pre-compiled regex for all of these cases
 			if matches, _ := regexp.MatchString("^Bisecting: [0-9]+ revision(s)? left to test after this \\(roughly [0-9]+ step(s)?\\)$", line); matches {
 				lines_until_hash = 1
-			} else if lines_until_hash == 0 {
+			} else if xbisect_status_match := statusMatchRe.FindStringSubmatch(line); xbisect_status_match != nil {
+				gLogger.Printf("xbisect_status_match: len=%d\n", len(xbisect_status_match))
+
+				res := StepResult{}
+				res.Name = xbisect_status_match[1]
+				res.Pass = xbisect_status_match[2] == "PASS"
+				res.ExitStatus, err = _get_exit_status(xbisect_status_match[3])
+				if err != nil {
+					gLogger.Printf("Error: %v\n", err)
+					ConsoleLogError("Failed to parse status of bisect step")
+					scan_succeed = false
+					break
+				}
+				if current_result == nil {
+					ConsoleLogError("Found bisect result before hash")
+					scan_succeed = false
+					break
+				}
+				current_result.StepResults = append(current_result.StepResults, res)
+			}
+
+			current_hash_from_line := ""
+			if lines_until_hash == 0 {
 				hashes := hashLineRe.FindStringSubmatch(line)
 				if len(hashes) != 2 {
 					ConsoleLogError("Failed to parse log of git message")
 					scan_succeed = false
 					break
 				}
-				hash := hashes[1]
-				ConsoleLogInfo("Hash %s", hash)
+				nb_commit_parse_from_regex += 1
+				current_hash_from_line = hashes[1]
+			} else if line == "Running bisect on current hash" {
+				// NOTE: The log: "Running bisect on current hash" is always logged. If it is the
+				// first log, there is not going to be a preceding line that informs what the
+				// current has his. In this case, the starting hash is pre-parsed, and once
+				// this log is found the very first time, it uses the pre-parsed initial commit
+				// hash.
+				if nb_commit_parse_from_regex == 0 && nb_commit_parse_from_current_line == 0 {
+					current_hash_from_line = initial_commit_hash
+				}
+				nb_commit_parse_from_current_line += 1
+			}
+
+			if len(current_hash_from_line) > 0 {
+				if _, has_hash := commit_results[current_hash_from_line]; has_hash {
+					ConsoleLogError("Detected duplicate commit: %s", current_hash_from_line)
+					scan_succeed = false
+					break
+				}
+				current_result = &CommitResult{}
+				current_result.Hash = current_hash_from_line
+				commit_results[current_hash_from_line] = current_result
 			}
 		}
+		gLogger.Printf("BISECT STREAM DUMP START>>>\n")
 		buf.WriteTo(gLogger.Writer())
+		gLogger.Printf("BISECT STREAM DUMP END>>>\n")
 		if !scan_succeed {
 			return false
+		}
+
+		for hash, result := range commit_results {
+			for _, step := range result.StepResults {
+				success_log := func() string {
+					if step.Pass {
+						return fmt.Sprintf("%s%sPASS%s", kFontBold, kColorGreen, kConsoleReset)
+					} else if step.ExitStatus == kBisectSkipCode {
+						return fmt.Sprintf("%s%sSKIP%s", kFontBold, kColorGray, kConsoleReset)
+					} else {
+						return fmt.Sprintf("%s%sFAIL%s", kFontBold, kColorRed, kConsoleReset)
+					}
+				}()
+				step_log := fmt.Sprintf("%s%s%s", kColorCyan, step.Name, kConsoleReset)
+				ConsoleLogInfo("%s %s %s", hash, step_log, success_log)
+			}
 		}
 
 		if err = cmd.Wait(); err != nil {
@@ -428,9 +604,10 @@ var cli struct {
 	Verbose bool `cmd:"" help:"Log everything to console." default:"false"`
 
 	Run struct {
-		Repo string `help:"Run bisect operation for the given project." short:"r"`
-		Lo   string `help:"Hash of the earlier commit."`
-		Hi   string `help:"Hash of the later commit."`
+		Repo  string   `help:"Run bisect operation for the given project." short:"r"`
+		Lo    string   `help:"Hash of the earlier commit."`
+		Hi    string   `help:"Hash of the later commit."`
+		Steps []string `help:"List of steps in the  bisect script. Each step will be passed to the bisect script as first argument and will record the return value each step as the status of the bisect."`
 	} `cmd:"" help:"Run a bisect operation"`
 
 	Import struct {
@@ -467,7 +644,7 @@ func Main() int {
 	case "import":
 		success = ImportGitRepo(cli.Import.Git, cli.Import.Name)
 	case "run":
-		success = RunBisect(cli.Run.Repo, cli.Run.Lo, cli.Run.Hi)
+		success = RunBisect(cli.Run.Repo, cli.Run.Lo, cli.Run.Hi, cli.Run.Steps)
 	case "clean":
 		success = CleanCache()
 	}
