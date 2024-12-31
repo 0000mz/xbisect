@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path"
@@ -99,18 +101,22 @@ type Config interface {
 	InitOrDie()
 
 	HasRepo(reponame string) bool
+	GetRepo(reponame string) *RepoInfo
 	// Add the repo to the config if it does not already exist.
 	AddRepo(reponame string, location string, remote string) bool
+
 	Save()
 }
 
+type RepoInfo struct {
+	Remote string
+	// The location of the repo on the user's local filesystem
+	LocalPath string
+	Name      string
+}
+
 type ConfigLayout struct {
-	Repos []struct {
-		Remote string
-		// The location of the repo on the user's local filesystem
-		LocalPath string
-		Name      string
-	}
+	Repos []RepoInfo
 }
 
 type ConfigImpl struct {
@@ -118,31 +124,30 @@ type ConfigImpl struct {
 	config_filepath string
 }
 
-func (c *ConfigImpl) AddRepo(reponame string, location string, remote string) bool {
+func (c *ConfigImpl) GetRepo(reponame string) *RepoInfo {
 	if c.data == nil {
-		return false
+		return nil
 	}
+	reponame = strings.ToLower(reponame)
+	for _, repo := range c.data.Repos {
+		if repo.Name == reponame {
+			return &repo
+		}
+	}
+	return nil
+}
+
+func (c *ConfigImpl) AddRepo(reponame string, location string, remote string) bool {
+	reponame = strings.ToLower(reponame)
 	if c.HasRepo(reponame) {
 		return false
 	}
-	c.data.Repos = append(c.data.Repos, struct {
-		Remote    string
-		LocalPath string
-		Name      string
-	}{Remote: remote, LocalPath: location, Name: reponame})
+	c.data.Repos = append(c.data.Repos, RepoInfo{Remote: remote, LocalPath: location, Name: reponame})
 	return true
 }
 
 func (c *ConfigImpl) HasRepo(reponame string) bool {
-	if c.data == nil {
-		return false
-	}
-	for _, repo := range c.data.Repos {
-		if repo.Name == reponame {
-			return true
-		}
-	}
-	return false
+	return c.GetRepo(reponame) != nil
 }
 
 func (c *ConfigImpl) Save() {
@@ -189,7 +194,7 @@ func InitConfigOrDie() {
 
 func filepathExists(filepath string) bool {
 	_, err := os.Stat(filepath)
-	return err != nil // !os.IsNotExist(err)
+	return err == nil // !os.IsNotExist(err)
 }
 
 func ImportGitRepo(repo_url string, name string) {
@@ -224,20 +229,8 @@ func ImportGitRepo(repo_url string, name string) {
 		os.Exit(1)
 	}
 
-	command_args := []string{"git", "clone", repo_url, clonedir}
-	gLogger.Printf("Running: %s\n", strings.Join(command_args, " "))
-	cmd := exec.Command(command_args[0], command_args[1:]...)
-	cmd.Stdout = gLogFileHandler
-	cmd.Stderr = gLogFileHandler
-
 	ConsoleLogInfo("Cloning git repo: %s", repo_url)
-	err = cmd.Start()
-	if err != nil {
-		gLogger.Printf("Error: %v\n", err)
-		ConsoleLogError("Git clone failed")
-		os.Exit(1)
-	}
-	err = cmd.Wait()
+	err = runCommand("git", "clone", repo_url, clonedir)
 	if err != nil {
 		gLogger.Printf("Error: %v\n", err)
 		ConsoleLogError("Git clone failed")
@@ -246,17 +239,81 @@ func ImportGitRepo(repo_url string, name string) {
 	gConfig.AddRepo(name, clonedir, repo_url)
 }
 
+func CleanCache() {
+	cachedir := path.Join(GetAppDataDir(), "cache")
+	err := os.RemoveAll(cachedir)
+	if err != nil {
+		gLogger.Printf("Error: %v\n", err)
+		ConsoleLogError("Error occurred when removing cache dir")
+		os.Exit(1)
+	} else {
+		ConsoleLogInfo("Successfully cleaned up cache.")
+	}
+}
+
+func runCommand(command ...string) error {
+	if len(command) < 1 {
+		return fmt.Errorf("Empty command")
+	}
+	gLogger.Printf("Running command: %s\n", strings.Join(command, " "))
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Stdout = gLogFileHandler
+	cmd.Stderr = gLogFileHandler
+	return cmd.Run()
+}
+
+func RunBisect(reponame string) {
+	repo := gConfig.GetRepo(reponame)
+	if repo == nil {
+		ConsoleLogError("No imported repo with name: \"%s\". Run %s import --help",
+			reponame, kApplicationName)
+		os.Exit(1)
+	}
+
+	cachedir := ""
+	for {
+		hint_dirname := fmt.Sprintf("%s_%d", reponame, rand.Int())
+		cachedir = path.Join(GetAppDataDir(), "cache", hint_dirname)
+		gLogger.Printf("Considering cache dir: %s\n", cachedir)
+		if !filepathExists(cachedir) {
+			break
+		}
+	}
+
+	var err error
+	err = os.MkdirAll(cachedir, os.ModePerm)
+	if err != nil {
+		gLogger.Printf("Error: %v\n", err)
+		ConsoleLogError("Failed to create cache dir: %s", cachedir)
+		os.Exit(1)
+	}
+	ConsoleLogInfo("Using cache directory for bisect: %s\n", cachedir)
+
+	// Copy the repo source to the cache location.
+	{
+		cacherepo := path.Join(cachedir, "_repo")
+		if err = runCommand("cp", "--recursive", repo.LocalPath, cacherepo); err != nil {
+			gLogger.Printf("Error: %v\n", err)
+			ConsoleLogError("Failed to copy repo to cache location.")
+			os.Exit(1)
+		}
+	}
+}
+
 var cli struct {
-	Verbose bool `cmd:"" help:"Log everything to console" default:"false"`
+	Verbose bool `cmd:"" help:"Log everything to console." default:"false"`
 
 	Run struct {
-		Repo string `help:"Run bisect operation for the given project" short:"r"`
+		Repo string `help:"Run bisect operation for the given project." short:"r"`
 	} `cmd:"" help:"Run a bisect operation"`
 
 	Import struct {
 		Git  string `help:"Import repo from remote git url"`
 		Name string `help:"The name to reference the repo by"`
 	} `cmd:"" help:"Import remote projects that you want to run bisect on."`
+
+	Clean struct {
+	} `cmd:"" help:"Clean up the cache."`
 }
 
 func main() {
@@ -282,5 +339,9 @@ func main() {
 	switch ctx.Command() {
 	case "import":
 		ImportGitRepo(cli.Import.Git, cli.Import.Name)
+	case "run":
+		RunBisect(cli.Run.Repo)
+	case "clean":
+		CleanCache()
 	}
 }
