@@ -23,8 +23,6 @@ import (
 const (
 	kApplicationName       = "xbisect"
 	kApplicationDescrption = "Utility for bisecting applications"
-	// TODO: Make this a pre-compiled regex
-	kAlphanumericDashUnderlineRe = "^[a-zA-Z0-9_-]+$"
 
 	// Color Codes
 	kColorRed     = "\033[31m"
@@ -42,6 +40,9 @@ var (
 	gLogger         *log.Logger      = nil
 	gConsoleLogger  *charmlog.Logger = nil
 	gConfig         Config
+
+	gAlphanumericDashUnderlineRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	gBisectingRevisionsLogRe     = regexp.MustCompile(`^Bisecting: [0-9]+ revision(s)? left to test after this \\(roughly [0-9]+ step(s)?\\)$`)
 )
 
 // The default appdata directory is $HOME/.xbisect.
@@ -222,11 +223,8 @@ func ImportGitRepo(repo_url string, name string) bool {
 		ConsoleLogError("--name not specified for repo import.")
 		return false
 	}
-	if matched, err := regexp.MatchString(kAlphanumericDashUnderlineRe, name); !matched || err != nil {
+	if matched := gAlphanumericDashUnderlineRe.MatchString(name); !matched {
 		ConsoleLogError("Invalid repo name. Only alphanumeric and underscore/dash allowed.")
-		if err != nil {
-			gLogger.Printf("Regex error: %v\n", err)
-		}
 		return false
 	}
 	name = strings.ToLower(name)
@@ -315,11 +313,8 @@ func RunBisect(reponame, lo, hi string, steps []string) bool {
 		return false
 	}
 	for _, step := range steps {
-		if matched, err := regexp.MatchString(kAlphanumericDashUnderlineRe, step); !matched || err != nil {
+		if matched := gAlphanumericDashUnderlineRe.MatchString(step); !matched {
 			ConsoleLogError("Invalid step name. Only alphanumeric and underscore/dash allowed.")
-			if err != nil {
-				gLogger.Printf("Regex error: %v\n", err)
-			}
 			return false
 		}
 	}
@@ -529,8 +524,7 @@ func RunBisect(reponame, lo, hi string, steps []string) bool {
 			lines_until_hash -= 1
 
 			line := strings.TrimSpace(scanner.Text())
-			// TODO: Use pre-compiled regex for all of these cases
-			if matches, _ := regexp.MatchString("^Bisecting: [0-9]+ revision(s)? left to test after this \\(roughly [0-9]+ step(s)?\\)$", line); matches {
+			if matches := gBisectingRevisionsLogRe.MatchString(line); matches {
 				lines_until_hash = 1
 			} else if xbisect_status_match := statusMatchRe.FindStringSubmatch(line); xbisect_status_match != nil {
 				gLogger.Printf("xbisect_status_match: len=%d\n", len(xbisect_status_match))
