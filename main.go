@@ -453,7 +453,7 @@ func RunBisect(reponame, lo, hi string, steps []string) bool {
 		// by the caller.
 		script_file := tmpfile.Name()
 		wrapper_script_file, err := os.CreateTemp("", "bisect_script_wrapper")
-		wrapper_script := ``
+		wrapper_script := "#!/bin/bash\n"
 		for _, step := range steps {
 			wrapper_script += _wrap_step(script_file, step) // fmt.Sprintf("%s %s\n", script_file, step)
 		}
