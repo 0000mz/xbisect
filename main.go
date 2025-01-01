@@ -354,6 +354,7 @@ func RunBisect(reponame, lo, hi string, steps []string) bool {
 	// DBG: Create tempfile for the script that will be executed in the bisect
 	// operation.
 	tmpfile, err := os.CreateTemp("", "bisect_script")
+	defer os.Remove(tmpfile.Name())
 	if err != nil {
 		ConsoleLogError("Failed to create temp bisect script")
 		return false
@@ -448,6 +449,7 @@ func RunBisect(reponame, lo, hi string, steps []string) bool {
 		// by the caller.
 		script_file := tmpfile.Name()
 		wrapper_script_file, err := os.CreateTemp("", "bisect_script_wrapper")
+		defer os.Remove(wrapper_script_file.Name())
 		wrapper_script := "#!/bin/bash\n"
 		for _, step := range steps {
 			wrapper_script += _wrap_step(script_file, step) // fmt.Sprintf("%s %s\n", script_file, step)
